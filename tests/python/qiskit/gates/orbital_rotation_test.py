@@ -221,6 +221,25 @@ def test_orbital_rotation_n_layers_spinless():
     np.testing.assert_allclose(result, expected)
 
 
+def test_orbital_rotation_drop_layers_spinless():
+    """Test dropping explicit Givens brickwork layers in an orbital rotation gate."""
+    norb = 6
+    drop_layers = (1, 4)
+    layers = tuple(layer for layer in range(norb) if layer not in drop_layers)
+    interaction_pairs = [
+        (i, i + 1) for layer in layers for i in range(layer % 2, norb - 1, 2)
+    ]
+    orbital_rotation = ffsim.random.random_unitary(norb, seed=RNG)
+
+    gate = ffsim.qiskit.OrbitalRotationSpinlessJW(
+        norb, orbital_rotation, drop_layers=drop_layers
+    )
+
+    decomposed = gate.definition
+    assert decomposed is not None
+    assert decomposed.count_ops()["xx_plus_yy"] == len(interaction_pairs)
+
+
 @pytest.mark.parametrize(
     "norb, nelec", ffsim.testing.generate_norb_nelec(exhaustive=False)
 )

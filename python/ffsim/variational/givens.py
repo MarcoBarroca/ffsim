@@ -15,6 +15,8 @@ from __future__ import annotations
 import cmath
 import itertools
 import math
+import operator as operator_module
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
 
@@ -153,6 +155,7 @@ class GivensAnsatzOp(
         orbital_rotation: np.ndarray,
         *,
         n_layers: int | None = None,
+        drop_layers: Sequence[int] | None = None,
         tol: float = 1e-12,
         optimize: bool = False,
         method: str = "L-BFGS-B",
@@ -168,11 +171,15 @@ class GivensAnsatzOp(
                 If not specified, the full ``norb`` layers are used. If fewer than
                 ``norb`` layers are specified, then the returned operator is generally
                 an approximation of the orbital rotation.
+            drop_layers: The brickwork layer indices to drop from the full ``norb``
+                layer decomposition. This argument cannot be specified together with
+                ``n_layers``.
             tol: Tolerance for the Givens decomposition of the orbital rotation.
                 Matrix entries smaller than this value will be treated as equal to zero.
             optimize: Whether to optimize the compressed Givens ansatz parameters to
                 maximize the Hilbert-Schmidt overlap with the orbital rotation.
-                This argument is ignored when ``n_layers`` is not specified.
+                This argument is ignored when ``n_layers`` and ``drop_layers`` are not
+                specified.
             method: The optimization method. See the documentation of
                 `scipy.optimize.minimize`_ for possible values.
                 This argument is ignored if ``optimize`` is set to ``False``.
@@ -188,6 +195,8 @@ class GivensAnsatzOp(
         Raises:
             ValueError: ``orbital_rotation`` was not a square matrix.
             ValueError: ``n_layers`` was negative or larger than ``norb``.
+            ValueError: ``n_layers`` and ``drop_layers`` were both specified.
+            ValueError: ``drop_layers`` contained invalid layer indices.
             ValueError: ``return_optimize_result`` was set to ``True`` but
                 ``optimize`` was set to ``False``.
 
@@ -200,13 +209,21 @@ class GivensAnsatzOp(
         ):
             raise ValueError("orbital_rotation must be a square matrix.")
         norb, _ = orbital_rotation.shape
-        if n_layers is None:
-            n_layers = norb
+        if n_layers is not None and drop_layers is not None:
+            raise ValueError("n_layers and drop_layers cannot both be specified.")
+        if n_layers is not None:
+            n_layers = operator_module.index(n_layers)
+            if n_layers < 0 or n_layers > norb:
+                raise ValueError(
+                    f"n_layers must be between 0 and norb={norb}. Got {n_layers}."
+                )
+            layers = tuple(range(n_layers))
+        elif drop_layers is not None:
+            dropped = set(_normalize_drop_layers(drop_layers, norb=norb))
+            layers = tuple(layer for layer in range(norb) if layer not in dropped)
+        else:
+            layers = tuple(range(norb))
             optimize = False
-        if n_layers < 0 or n_layers > norb:
-            raise ValueError(
-                f"n_layers must be between 0 and norb={norb}. Got {n_layers}."
-            )
         if return_optimize_result and not optimize:
             raise ValueError(
                 "return_optimize_result can only be True if optimize is True."
@@ -226,17 +243,17 @@ class GivensAnsatzOp(
         interaction_pairs, thetas, phis = _brickwork_givens_rotations(
             interaction_pairs, thetas, phis, norb=norb
         )
-        n_givens = len(_brickwork_layer_interaction_pairs(norb, n_layers))
+        givens_indices = _brickwork_layer_givens_indices(norb, layers)
         operator = GivensAnsatzOp(
             norb=norb,
-            interaction_pairs=interaction_pairs[:n_givens],
-            thetas=np.array(thetas[:n_givens]),
-            phis=np.array(phis[:n_givens]),
+            interaction_pairs=[interaction_pairs[i] for i in givens_indices],
+            thetas=np.array([thetas[i] for i in givens_indices]),
+            phis=np.array([phis[i] for i in givens_indices]),
             phase_angles=np.angle(phases),
         )
-        if n_layers != norb:
+        if n_layers is not None and n_layers != norb:
             operator = _best_initial_givens_ansatz(
-                orbital_rotation, operator, norb=norb, n_layers=n_layers
+                orbital_rotation, operator, norb=norb, layers=layers
             )
         if optimize:
             result = _optimize_givens_ansatz(
@@ -382,9 +399,46 @@ def _brickwork_layer_interaction_pairs(
     norb: int, n_layers: int
 ) -> list[tuple[int, int]]:
     """Return interaction pairs for the requested number of brickwork layers."""
-    return [
-        (i, i + 1) for layer in range(n_layers) for i in range(layer % 2, norb - 1, 2)
-    ]
+    return _brickwork_layers_interaction_pairs(norb, range(n_layers))
+
+
+def _brickwork_layers_interaction_pairs(
+    norb: int, layers: Sequence[int]
+) -> list[tuple[int, int]]:
+    """Return interaction pairs for the requested brickwork layers."""
+    return [(i, i + 1) for layer in layers for i in range(layer % 2, norb - 1, 2)]
+
+
+def _brickwork_layer_givens_indices(norb: int, layers: Sequence[int]) -> list[int]:
+    """Return flattened Givens rotation indices for the requested brickwork layers."""
+    layer_set = set(layers)
+    indices = []
+    offset = 0
+    for layer in range(norb):
+        n_givens = len(range(layer % 2, norb - 1, 2))
+        if layer in layer_set:
+            indices.extend(range(offset, offset + n_givens))
+        offset += n_givens
+    return indices
+
+
+def _normalize_drop_layers(drop_layers: Sequence[int], *, norb: int) -> tuple[int, ...]:
+    """Validate and sort dropped brickwork layer indices."""
+    normalized = []
+    for layer in drop_layers:
+        try:
+            layer = operator_module.index(layer)
+        except TypeError as exc:
+            raise TypeError("drop_layers must contain integers.") from exc
+        if layer < 0 or layer >= norb:
+            raise ValueError(
+                "drop_layers entries must be between 0 and norb - 1 "
+                f"for norb={norb}. Got {layer}."
+            )
+        normalized.append(layer)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("drop_layers must not contain duplicate entries.")
+    return tuple(sorted(normalized))
 
 
 def _best_initial_givens_ansatz(
@@ -392,10 +446,10 @@ def _best_initial_givens_ansatz(
     operator: GivensAnsatzOp,
     *,
     norb: int,
-    n_layers: int,
+    layers: Sequence[int],
 ) -> GivensAnsatzOp:
     """Choose the better of truncated-decomposition and identity initial guesses."""
-    interaction_pairs = _brickwork_layer_interaction_pairs(norb, n_layers)
+    interaction_pairs = _brickwork_layers_interaction_pairs(norb, layers)
     identity_operator = GivensAnsatzOp(
         norb=norb,
         interaction_pairs=interaction_pairs,

@@ -130,9 +130,25 @@ def _brickwork_layer_interaction_pairs(
     norb: int, n_layers: int
 ) -> list[tuple[int, int]]:
     """Return interaction pairs for a fixed number of brickwork layers."""
-    return [
-        (i, i + 1) for layer in range(n_layers) for i in range(layer % 2, norb - 1, 2)
-    ]
+    return _brickwork_layers_interaction_pairs(norb, range(n_layers))
+
+
+def _brickwork_layers_interaction_pairs(norb: int, layers) -> list[tuple[int, int]]:
+    """Return interaction pairs for fixed brickwork layers."""
+    return [(i, i + 1) for layer in layers for i in range(layer % 2, norb - 1, 2)]
+
+
+def _brickwork_layer_givens_indices(norb: int, layers) -> list[int]:
+    """Return flattened Givens rotation indices for fixed brickwork layers."""
+    layer_set = set(layers)
+    indices = []
+    offset = 0
+    for layer in range(norb):
+        n_givens = len(range(layer % 2, norb - 1, 2))
+        if layer in layer_set:
+            indices.extend(range(offset, offset + n_givens))
+        offset += n_givens
+    return indices
 
 
 def _givens_overlap_error(target: np.ndarray, actual: np.ndarray) -> float:
@@ -195,6 +211,28 @@ def test_givens_orbital_rotation_compressed_layers_optimize():
     assert optimized_error < initial_error
 
 
+def test_givens_orbital_rotation_drop_layers():
+    """Test dropping explicit Givens brickwork layers."""
+    norb = 6
+    drop_layers = (1, 4)
+    layers = tuple(layer for layer in range(norb) if layer not in drop_layers)
+    orbital_rotation = ffsim.random.random_unitary(norb, seed=RNG)
+    full = ffsim.GivensAnsatzOp.from_orbital_rotation(orbital_rotation)
+    indices = _brickwork_layer_givens_indices(norb, layers)
+    expected = ffsim.GivensAnsatzOp(
+        norb=norb,
+        interaction_pairs=[full.interaction_pairs[i] for i in indices],
+        thetas=full.thetas[indices],
+        phis=None if full.phis is None else full.phis[indices],
+        phase_angles=full.phase_angles,
+    )
+    compressed = ffsim.GivensAnsatzOp.from_orbital_rotation(
+        orbital_rotation, drop_layers=drop_layers
+    )
+
+    assert ffsim.approx_eq(compressed, expected)
+
+
 def test_givens_orbital_rotation_compressed_layers_validation():
     """Test validation of compressed Givens layer count."""
     orbital_rotation = np.eye(4)
@@ -205,6 +243,18 @@ def test_givens_orbital_rotation_compressed_layers_validation():
     with pytest.raises(ValueError, match="return_optimize_result"):
         _ = ffsim.GivensAnsatzOp.from_orbital_rotation(
             orbital_rotation, n_layers=2, return_optimize_result=True
+        )
+    with pytest.raises(ValueError, match="cannot both"):
+        _ = ffsim.GivensAnsatzOp.from_orbital_rotation(
+            orbital_rotation, n_layers=2, drop_layers=(1,)
+        )
+    with pytest.raises(ValueError, match="drop_layers"):
+        _ = ffsim.GivensAnsatzOp.from_orbital_rotation(
+            orbital_rotation, drop_layers=(-1,)
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        _ = ffsim.GivensAnsatzOp.from_orbital_rotation(
+            orbital_rotation, drop_layers=(1, 1)
         )
 
 
