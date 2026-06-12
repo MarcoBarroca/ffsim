@@ -126,6 +126,88 @@ def test_givens_orbital_rotation_roundtrip(norb: int):
     np.testing.assert_allclose(roundtripped, orbital_rotation)
 
 
+def _brickwork_layer_interaction_pairs(
+    norb: int, n_layers: int
+) -> list[tuple[int, int]]:
+    """Return interaction pairs for a fixed number of brickwork layers."""
+    return [
+        (i, i + 1) for layer in range(n_layers) for i in range(layer % 2, norb - 1, 2)
+    ]
+
+
+def _givens_overlap_error(target: np.ndarray, actual: np.ndarray) -> float:
+    """Return Hilbert-Schmidt distance between matrices, up to global phase."""
+    if target.shape[0] == 0:
+        return 0.0
+    return 1 - abs(np.trace(target.T.conj() @ actual)) / target.shape[0]
+
+
+def test_givens_orbital_rotation_compressed_layers_roundtrip():
+    """Test round-tripping an orbital rotation with fewer Givens layers."""
+    norb = 6
+    n_layers = 3
+    interaction_pairs = _brickwork_layer_interaction_pairs(norb, n_layers)
+    operator = ffsim.GivensAnsatzOp(
+        norb=norb,
+        interaction_pairs=interaction_pairs,
+        thetas=RNG.uniform(-0.2, 0.2, size=len(interaction_pairs)),
+        phis=RNG.uniform(-np.pi, np.pi, size=len(interaction_pairs)),
+        phase_angles=RNG.uniform(-np.pi, np.pi, size=norb),
+    )
+
+    orbital_rotation = operator.to_orbital_rotation()
+    compressed = ffsim.GivensAnsatzOp.from_orbital_rotation(
+        orbital_rotation, n_layers=n_layers
+    )
+
+    assert compressed.interaction_pairs == interaction_pairs
+    assert len(compressed.interaction_pairs) < norb * (norb - 1) // 2
+    np.testing.assert_allclose(
+        compressed.to_orbital_rotation(), orbital_rotation, atol=1e-12
+    )
+
+
+def test_givens_orbital_rotation_compressed_layers_optimize():
+    """Test optimizing a compressed Givens ansatz."""
+    norb = 6
+    n_layers = 2
+    generator = 0.02j * ffsim.random.random_hermitian(norb, seed=RNG)
+    orbital_rotation = scipy.linalg.expm(generator)
+
+    initial = ffsim.GivensAnsatzOp.from_orbital_rotation(
+        orbital_rotation, n_layers=n_layers
+    )
+    optimized, result = ffsim.GivensAnsatzOp.from_orbital_rotation(
+        orbital_rotation,
+        n_layers=n_layers,
+        optimize=True,
+        options={"maxiter": 300},
+        return_optimize_result=True,
+    )
+
+    initial_error = _givens_overlap_error(
+        orbital_rotation, initial.to_orbital_rotation()
+    )
+    optimized_error = _givens_overlap_error(
+        orbital_rotation, optimized.to_orbital_rotation()
+    )
+    assert result.fun == pytest.approx(optimized_error)
+    assert optimized_error < initial_error
+
+
+def test_givens_orbital_rotation_compressed_layers_validation():
+    """Test validation of compressed Givens layer count."""
+    orbital_rotation = np.eye(4)
+    with pytest.raises(ValueError, match="n_layers"):
+        _ = ffsim.GivensAnsatzOp.from_orbital_rotation(orbital_rotation, n_layers=-1)
+    with pytest.raises(ValueError, match="n_layers"):
+        _ = ffsim.GivensAnsatzOp.from_orbital_rotation(orbital_rotation, n_layers=5)
+    with pytest.raises(ValueError, match="return_optimize_result"):
+        _ = ffsim.GivensAnsatzOp.from_orbital_rotation(
+            orbital_rotation, n_layers=2, return_optimize_result=True
+        )
+
+
 def test_givens_orbital_rotation_t1_roundtrip():
     """Test round-tripping orbital rotation from t1 amplitudes."""
     mol = pyscf.gto.Mole()

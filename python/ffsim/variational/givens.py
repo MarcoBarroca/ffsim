@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import cast
 
 import numpy as np
+import scipy.optimize
 from scipy.linalg.lapack import zrot
 
 from ffsim import linalg, protocols
@@ -148,14 +149,72 @@ class GivensAnsatzOp(
         )
 
     @staticmethod
-    def from_orbital_rotation(orbital_rotation: np.ndarray) -> GivensAnsatzOp:
+    def from_orbital_rotation(
+        orbital_rotation: np.ndarray,
+        *,
+        n_layers: int | None = None,
+        tol: float = 1e-12,
+        optimize: bool = False,
+        method: str = "L-BFGS-B",
+        callback=None,
+        options: dict | None = None,
+        return_optimize_result: bool = False,
+    ) -> GivensAnsatzOp | tuple[GivensAnsatzOp, scipy.optimize.OptimizeResult]:
         """Initialize the operator from an orbital rotation.
 
         Args:
             orbital_rotation: The orbital rotation.
+            n_layers: The number of brickwork layers of Givens rotations to use.
+                If not specified, the full ``norb`` layers are used. If fewer than
+                ``norb`` layers are specified, then the returned operator is generally
+                an approximation of the orbital rotation.
+            tol: Tolerance for the Givens decomposition of the orbital rotation.
+                Matrix entries smaller than this value will be treated as equal to zero.
+            optimize: Whether to optimize the compressed Givens ansatz parameters to
+                maximize the Hilbert-Schmidt overlap with the orbital rotation.
+                This argument is ignored when ``n_layers`` is not specified.
+            method: The optimization method. See the documentation of
+                `scipy.optimize.minimize`_ for possible values.
+                This argument is ignored if ``optimize`` is set to ``False``.
+            callback: Callback function for the optimization. See the documentation of
+                `scipy.optimize.minimize`_ for usage.
+                This argument is ignored if ``optimize`` is set to ``False``.
+            options: Options for the optimization. See the documentation of
+                `scipy.optimize.minimize`_ for usage.
+                This argument is ignored if ``optimize`` is set to ``False``.
+            return_optimize_result: Whether to also return the `OptimizeResult`_
+                returned by `scipy.optimize.minimize`_.
+
+        Raises:
+            ValueError: ``orbital_rotation`` was not a square matrix.
+            ValueError: ``n_layers`` was negative or larger than ``norb``.
+            ValueError: ``return_optimize_result`` was set to ``True`` but
+                ``optimize`` was set to ``False``.
+
+        .. _scipy.optimize.minimize: https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.minimize.html
+        .. _OptimizeResult: https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.OptimizeResult.html
         """
+        if (
+            orbital_rotation.ndim != 2
+            or orbital_rotation.shape[0] != orbital_rotation.shape[1]
+        ):
+            raise ValueError("orbital_rotation must be a square matrix.")
         norb, _ = orbital_rotation.shape
-        givens_rotations, phases = linalg.givens_decomposition(orbital_rotation)
+        if n_layers is None:
+            n_layers = norb
+            optimize = False
+        if n_layers < 0 or n_layers > norb:
+            raise ValueError(
+                f"n_layers must be between 0 and norb={norb}. Got {n_layers}."
+            )
+        if return_optimize_result and not optimize:
+            raise ValueError(
+                "return_optimize_result can only be True if optimize is True."
+            )
+
+        givens_rotations, phases = linalg.givens_decomposition(
+            orbital_rotation, tol=tol
+        )
         interaction_pairs = []
         thetas = []
         phis = []
@@ -167,13 +226,36 @@ class GivensAnsatzOp(
         interaction_pairs, thetas, phis = _brickwork_givens_rotations(
             interaction_pairs, thetas, phis, norb=norb
         )
-        return GivensAnsatzOp(
+        n_givens = len(_brickwork_layer_interaction_pairs(norb, n_layers))
+        operator = GivensAnsatzOp(
             norb=norb,
-            interaction_pairs=interaction_pairs,
-            thetas=np.array(thetas),
-            phis=np.array(phis),
+            interaction_pairs=interaction_pairs[:n_givens],
+            thetas=np.array(thetas[:n_givens]),
+            phis=np.array(phis[:n_givens]),
             phase_angles=np.angle(phases),
         )
+        if n_layers != norb:
+            operator = _best_initial_givens_ansatz(
+                orbital_rotation, operator, norb=norb, n_layers=n_layers
+            )
+        if optimize:
+            result = _optimize_givens_ansatz(
+                orbital_rotation,
+                operator,
+                method=method,
+                callback=callback,
+                options=options,
+            )
+            operator = GivensAnsatzOp.from_parameters(
+                result.x,
+                norb=operator.norb,
+                interaction_pairs=operator.interaction_pairs,
+                with_phis=operator.phis is not None,
+                with_phase_angles=operator.phase_angles is not None,
+            )
+            if return_optimize_result:
+                return operator, result
+        return operator
 
     def to_orbital_rotation(self) -> np.ndarray:
         """Convert the Givens ansatz operator to an orbital rotation."""
@@ -294,3 +376,72 @@ def _brickwork_givens_rotations(
                 new_thetas.append(theta)
                 new_phis.append(phi)
     return new_interaction_pairs, new_thetas, new_phis
+
+
+def _brickwork_layer_interaction_pairs(
+    norb: int, n_layers: int
+) -> list[tuple[int, int]]:
+    """Return interaction pairs for the requested number of brickwork layers."""
+    return [
+        (i, i + 1) for layer in range(n_layers) for i in range(layer % 2, norb - 1, 2)
+    ]
+
+
+def _best_initial_givens_ansatz(
+    orbital_rotation: np.ndarray,
+    operator: GivensAnsatzOp,
+    *,
+    norb: int,
+    n_layers: int,
+) -> GivensAnsatzOp:
+    """Choose the better of truncated-decomposition and identity initial guesses."""
+    interaction_pairs = _brickwork_layer_interaction_pairs(norb, n_layers)
+    identity_operator = GivensAnsatzOp(
+        norb=norb,
+        interaction_pairs=interaction_pairs,
+        thetas=np.zeros(len(interaction_pairs)),
+        phis=np.zeros(len(interaction_pairs)),
+        phase_angles=np.angle(np.diag(orbital_rotation)),
+    )
+    if _givens_ansatz_error(identity_operator, orbital_rotation) < _givens_ansatz_error(
+        operator, orbital_rotation
+    ):
+        return identity_operator
+    return operator
+
+
+def _optimize_givens_ansatz(
+    orbital_rotation: np.ndarray,
+    operator: GivensAnsatzOp,
+    *,
+    method: str,
+    callback,
+    options: dict | None,
+) -> scipy.optimize.OptimizeResult:
+    """Optimize a Givens ansatz to approximate an orbital rotation."""
+    return scipy.optimize.minimize(
+        lambda x: _givens_ansatz_error(
+            GivensAnsatzOp.from_parameters(
+                x,
+                norb=operator.norb,
+                interaction_pairs=operator.interaction_pairs,
+                with_phis=operator.phis is not None,
+                with_phase_angles=operator.phase_angles is not None,
+            ),
+            orbital_rotation,
+        ),
+        operator.to_parameters(),
+        method=method,
+        callback=callback,
+        options=options,
+    )
+
+
+def _givens_ansatz_error(
+    operator: GivensAnsatzOp, orbital_rotation: np.ndarray
+) -> float:
+    """Return Hilbert-Schmidt distance from an orbital rotation, up to global phase."""
+    if operator.norb == 0:
+        return 0.0
+    overlap = np.trace(orbital_rotation.T.conj() @ operator.to_orbital_rotation())
+    return 1 - abs(overlap) / operator.norb

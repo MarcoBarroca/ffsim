@@ -27,6 +27,8 @@ from qiskit.circuit import (
 from qiskit.circuit.library import PhaseGate, XXPlusYYGate
 
 from ffsim import linalg
+from ffsim.qiskit.gates.givens_ansatz import _givens_ansatz_jw
+from ffsim.variational import GivensAnsatzOp
 
 
 def _validate_orbital_rotation(
@@ -77,6 +79,11 @@ class OrbitalRotationJW(Gate):
         orbital_rotation: np.ndarray | tuple[np.ndarray | None, np.ndarray | None],
         *,
         tol: float = 1e-12,
+        n_layers: int | None = None,
+        optimize: bool = False,
+        method: str = "L-BFGS-B",
+        callback=None,
+        options: dict | None = None,
         label: str | None = None,
         validate: bool = True,
         rtol: float = 1e-5,
@@ -95,6 +102,21 @@ class OrbitalRotationJW(Gate):
                 that spin sector.
             tol: Tolerance for the Givens decomposition of the orbital rotation.
                 Matrix entries smaller than this value will be treated as equal to zero.
+            n_layers: The number of brickwork layers of Givens rotations to use.
+                If not specified, the full exact decomposition is used. If fewer than
+                ``norb`` layers are specified, then the gate generally approximates
+                the input orbital rotation.
+            optimize: Whether to optimize the compressed Givens ansatz parameters.
+                This argument is ignored when ``n_layers`` is not specified.
+            method: The optimization method. See the documentation of
+                ``scipy.optimize.minimize`` for possible values.
+                This argument is ignored if ``optimize`` is set to ``False``.
+            callback: Callback function for the optimization. See the documentation of
+                ``scipy.optimize.minimize`` for usage.
+                This argument is ignored if ``optimize`` is set to ``False``.
+            options: Options for the optimization. See the documentation of
+                ``scipy.optimize.minimize`` for usage.
+                This argument is ignored if ``optimize`` is set to ``False``.
             label: The label of the gate.
             validate: Whether to check that the input orbital rotation(s) is unitary
                 and raise an error if it isn't.
@@ -121,6 +143,11 @@ class OrbitalRotationJW(Gate):
             else:
                 self.orbital_rotation_b = orbital_rotation_b
         self.tol = tol
+        self.n_layers = n_layers
+        self.optimize = optimize
+        self.method = method
+        self.callback = callback
+        self.options = options
         super().__init__("orb_rot_jw", 2 * norb, [], label=label)
 
     def _define(self):
@@ -131,11 +158,25 @@ class OrbitalRotationJW(Gate):
         alpha_qubits = qubits[:norb]
         beta_qubits = qubits[norb:]
         for instruction in _orbital_rotation_jw(
-            alpha_qubits, self.orbital_rotation_a, tol=self.tol
+            alpha_qubits,
+            self.orbital_rotation_a,
+            tol=self.tol,
+            n_layers=self.n_layers,
+            optimize=self.optimize,
+            method=self.method,
+            callback=self.callback,
+            options=self.options,
         ):
             circuit.append(instruction)
         for instruction in _orbital_rotation_jw(
-            beta_qubits, self.orbital_rotation_b, tol=self.tol
+            beta_qubits,
+            self.orbital_rotation_b,
+            tol=self.tol,
+            n_layers=self.n_layers,
+            optimize=self.optimize,
+            method=self.method,
+            callback=self.callback,
+            options=self.options,
         ):
             circuit.append(instruction)
         self.definition = circuit
@@ -145,6 +186,12 @@ class OrbitalRotationJW(Gate):
         return OrbitalRotationJW(
             self.norb,
             (self.orbital_rotation_a.T.conj(), self.orbital_rotation_b.T.conj()),
+            tol=self.tol,
+            n_layers=self.n_layers,
+            optimize=self.optimize,
+            method=self.method,
+            callback=self.callback,
+            options=self.options,
         )
 
 
@@ -160,6 +207,11 @@ class OrbitalRotationSpinlessJW(Gate):
         orbital_rotation: np.ndarray,
         *,
         tol: float = 1e-12,
+        n_layers: int | None = None,
+        optimize: bool = False,
+        method: str = "L-BFGS-B",
+        callback=None,
+        options: dict | None = None,
         label: str | None = None,
         validate: bool = True,
         rtol: float = 1e-5,
@@ -172,6 +224,21 @@ class OrbitalRotationSpinlessJW(Gate):
             orbital_rotation: The orbital rotation.
             tol: Tolerance for the Givens decomposition of the orbital rotation.
                 Matrix entries smaller than this value will be treated as equal to zero.
+            n_layers: The number of brickwork layers of Givens rotations to use.
+                If not specified, the full exact decomposition is used. If fewer than
+                ``norb`` layers are specified, then the gate generally approximates
+                the input orbital rotation.
+            optimize: Whether to optimize the compressed Givens ansatz parameters.
+                This argument is ignored when ``n_layers`` is not specified.
+            method: The optimization method. See the documentation of
+                ``scipy.optimize.minimize`` for possible values.
+                This argument is ignored if ``optimize`` is set to ``False``.
+            callback: Callback function for the optimization. See the documentation of
+                ``scipy.optimize.minimize`` for usage.
+                This argument is ignored if ``optimize`` is set to ``False``.
+            options: Options for the optimization. See the documentation of
+                ``scipy.optimize.minimize`` for usage.
+                This argument is ignored if ``optimize`` is set to ``False``.
             label: The label of the gate.
             validate: Whether to check that the input orbital rotation(s) is unitary
                 and raise an error if it isn't.
@@ -188,6 +255,11 @@ class OrbitalRotationSpinlessJW(Gate):
         self.norb = norb
         self.orbital_rotation = orbital_rotation
         self.tol = tol
+        self.n_layers = n_layers
+        self.optimize = optimize
+        self.method = method
+        self.callback = callback
+        self.options = options
         super().__init__("orb_rot_spinless_jw", norb, [], label=label)
 
     def _define(self):
@@ -195,19 +267,55 @@ class OrbitalRotationSpinlessJW(Gate):
         qubits = QuantumRegister(self.num_qubits)
         circuit = QuantumCircuit(qubits, name=self.name)
         for instruction in _orbital_rotation_jw(
-            qubits, self.orbital_rotation, tol=self.tol
+            qubits,
+            self.orbital_rotation,
+            tol=self.tol,
+            n_layers=self.n_layers,
+            optimize=self.optimize,
+            method=self.method,
+            callback=self.callback,
+            options=self.options,
         ):
             circuit.append(instruction)
         self.definition = circuit
 
     def inverse(self):
         """Inverse gate."""
-        return OrbitalRotationSpinlessJW(self.norb, self.orbital_rotation.T.conj())
+        return OrbitalRotationSpinlessJW(
+            self.norb,
+            self.orbital_rotation.T.conj(),
+            tol=self.tol,
+            n_layers=self.n_layers,
+            optimize=self.optimize,
+            method=self.method,
+            callback=self.callback,
+            options=self.options,
+        )
 
 
 def _orbital_rotation_jw(
-    qubits: Sequence[Qubit], orbital_rotation: np.ndarray, tol: float
+    qubits: Sequence[Qubit],
+    orbital_rotation: np.ndarray,
+    tol: float,
+    n_layers: int | None = None,
+    optimize: bool = False,
+    method: str = "L-BFGS-B",
+    callback=None,
+    options: dict | None = None,
 ) -> Iterator[CircuitInstruction]:
+    if n_layers is not None:
+        givens_ansatz_op = GivensAnsatzOp.from_orbital_rotation(
+            orbital_rotation,
+            n_layers=n_layers,
+            tol=tol,
+            optimize=optimize,
+            method=method,
+            callback=callback,
+            options=options,
+        )
+        yield from _givens_ansatz_jw(qubits, givens_ansatz_op)
+        return
+
     givens_rotations, phase_shifts = linalg.givens_decomposition(
         orbital_rotation, tol=tol
     )

@@ -183,6 +183,44 @@ def test_orbital_rotation_tol():
     assert circuit.decompose().count_ops() == {"p": norb}
 
 
+def test_orbital_rotation_n_layers_spinless():
+    """Test compressing an orbital rotation to fewer Givens layers."""
+    norb = 6
+    n_layers = 3
+    interaction_pairs = [
+        (i, i + 1) for layer in range(n_layers) for i in range(layer % 2, norb - 1, 2)
+    ]
+    operator = ffsim.GivensAnsatzOp(
+        norb=norb,
+        interaction_pairs=interaction_pairs,
+        thetas=RNG.uniform(-0.2, 0.2, size=len(interaction_pairs)),
+        phis=RNG.uniform(-np.pi, np.pi, size=len(interaction_pairs)),
+        phase_angles=RNG.uniform(-np.pi, np.pi, size=norb),
+    )
+    orbital_rotation = operator.to_orbital_rotation()
+
+    gate = ffsim.qiskit.OrbitalRotationSpinlessJW(
+        norb, orbital_rotation, n_layers=n_layers
+    )
+    decomposed = gate.definition
+    assert decomposed is not None
+    assert decomposed.count_ops()["xx_plus_yy"] == len(interaction_pairs)
+
+    nocc = 3
+    small_vec = ffsim.random.random_state_vector(ffsim.dim(norb, nocc), seed=RNG)
+    big_vec = ffsim.qiskit.ffsim_vec_to_qiskit_vec(
+        small_vec, norb=norb, nelec=(nocc, 0)
+    )
+    statevec = Statevector(big_vec).evolve(gate)
+    result = ffsim.qiskit.qiskit_vec_to_ffsim_vec(
+        np.array(statevec), norb=norb, nelec=(nocc, 0)
+    )
+    expected = ffsim.apply_orbital_rotation(
+        small_vec, orbital_rotation, norb=norb, nelec=nocc
+    )
+    np.testing.assert_allclose(result, expected)
+
+
 @pytest.mark.parametrize(
     "norb, nelec", ffsim.testing.generate_norb_nelec(exhaustive=False)
 )
